@@ -48,4 +48,4 @@ ANTHROPIC_MODEL=claude-haiku-5-5
 3. ✅ Chatbot backend'i
 4. ✅ Sohbet arayüzü
 5. ✅ Sesli giriş
-6. ⏳ Vercel'e yayın
+
