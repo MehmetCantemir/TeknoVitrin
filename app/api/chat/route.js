@@ -96,12 +96,17 @@ function runTool(name, input, shownIds) {
   }
 }
 
+// Anahtarın başında/sonunda yanlışlıkla kopyalanan boşluk veya tırnakları temizler.
+function getApiKey() {
+  return (process.env.ANTHROPIC_API_KEY ?? "").trim().replace(/^["']|["']$/g, "");
+}
+
 async function callClaude(messages) {
   const response = await fetch(API_URL, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-api-key": process.env.ANTHROPIC_API_KEY,
+      "x-api-key": getApiKey(),
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
@@ -139,10 +144,14 @@ function sanitizeHistory(raw) {
 }
 
 export async function POST(request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey || !apiKey.startsWith("sk-ant-")) {
+  const apiKey = getApiKey();
+  if (!apiKey.startsWith("sk-ant-")) {
+    // Yerelde: .env.local dosyası. Vercel'de: Settings → Environment Variables (ardından Redeploy).
+    console.error(
+      apiKey ? "ANTHROPIC_API_KEY 'sk-ant-' ile başlamıyor." : "ANTHROPIC_API_KEY tanımlı değil."
+    );
     return NextResponse.json(
-      { error: "API anahtarı bulunamadı. .env.local dosyasını kontrol edip sunucuyu yeniden başlat." },
+      { error: "Asistan şu an yapılandırılmamış: sunucuda API anahtarı bulunamadı." },
       { status: 500 }
     );
   }

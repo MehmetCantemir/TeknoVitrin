@@ -1,5 +1,37 @@
 @import "tailwindcss";
 
+/* Renk ve yazı tipi sistemi: "Gece vitrini"
+   Bu değerler Tailwind sınıflarına dönüşür: bg-ink, text-steel, border-mist ... */
+@theme {
+  --color-ink: #0f1e33; /* mürekkep laciverti: metin, vitrin bölmeleri */
+  --color-navy: #1b2e4a; /* lacivert: hover ve ikincil yüzeyler */
+  --color-steel: #5a6b80; /* çelik gri: ikincil metin */
+  --color-mist: #dce6ee; /* sis: çizgiler ve kenarlıklar */
+  --color-frost: #eef3f6; /* buzlu zemin: sayfa arka planı */
+  --color-glacier: #8fc1d4; /* buzul mavisi: ışık, vurgu */
+  --color-fjord: #1f6e8c; /* fiyort: butonlar, linkler */
+  --color-lavender: #a9adf5; /* gaming ışığı */
+  --color-ice: #86d3c9; /* telefon ışığı */
+}
+
+@theme inline {
+  --font-sans: var(--font-plex), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-sora), ui-sans-serif, system-ui, sans-serif;
+}
+
 body {
-  @apply bg-slate-50 text-slate-900 antialiased;
+  @apply bg-frost font-sans text-ink antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-fjord);
+  outline-offset: 2px;
+}
+
+/* Yatay kayan alanlarda kaydırma çubuğunu gizler (mobil kategori seçici) */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
 }
