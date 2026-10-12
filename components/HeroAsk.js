@@ -33,6 +33,7 @@ export default function HeroAsk() {
           id="hero-ask"
           value={text}
           onChange={(e) => setText(e.target.value)}
+          maxLength={500}
           placeholder="Örneğin: üniversite için hafif bir laptop"
           className="min-w-0 flex-1 bg-transparent px-3 text-white placeholder:text-white/40 outline-none"
         />

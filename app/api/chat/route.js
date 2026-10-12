@@ -10,6 +10,7 @@ import {
   toCardProduct,
   toCompactProduct,
 } from "@/lib/products";
+import { checkRateLimit, formatWait, getClientKey } from "@/lib/rateLimit";
 
 const API_URL = "https://api.anthropic.com/v1/messages";
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-5-5";
@@ -153,6 +154,17 @@ export async function POST(request) {
     return NextResponse.json(
       { error: "Asistan şu an yapılandırılmamış: sunucuda API anahtarı bulunamadı." },
       { status: 500 }
+    );
+  }
+
+  // Kullanım sınırı: sınırı aşan istek Claude'a hiç gönderilmez, kredi harcanmaz.
+  const limit = checkRateLimit(getClientKey(request));
+  if (!limit.ok) {
+    return NextResponse.json(
+      {
+        error: `Kısa sürede çok fazla mesaj gönderdin (${limit.rule.label} en fazla ${limit.rule.limit}). ${formatWait(limit.retryAfterSec)} sonra tekrar deneyebilirsin.`,
+      },
+      { status: 429, headers: { "Retry-After": String(limit.retryAfterSec) } }
     );
   }
 

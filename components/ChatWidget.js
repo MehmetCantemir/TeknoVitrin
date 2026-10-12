@@ -167,6 +167,7 @@ export default function ChatWidget() {
               id="chat-input"
               value={speech.listening ? speech.transcript : input}
               onChange={(e) => setInput(e.target.value)}
+              maxLength={500}
               placeholder={speech.listening ? "Dinliyorum…" : "Mesajını yaz…"}
               className="min-w-0 flex-1 rounded-lg bg-frost px-3.5 py-2.5 text-sm outline-none ring-1 ring-transparent placeholder:text-steel/70 focus:ring-glacier"
               disabled={loading || speech.listening}
