@@ -8,11 +8,41 @@ import ProductImage from "@/components/ProductImage";
 import useSpeechRecognition from "@/lib/useSpeechRecognition";
 
 const WELCOME = {
+  welcome: true,
   role: "assistant",
   content:
     "Merhaba, ben TeknoVitrin asistanıyım. Cihazı ne için kullanacağını ve yaklaşık bütçeni yaz ya da söyle, sana vitrindeki uygun ürünleri göstereyim.",
   products: [],
 };
+
+// Sohbet, tarayıcı sekmesi kapanana kadar sessionStorage'da saklanır.
+// Sayfa yenilense de sohbet kaldığı yerden devam eder. Sekme kapanınca silinir.
+const STORAGE_KEY = "teknovitrin-sohbet-v1";
+const MAX_STORED = 40; // en fazla bu kadar mesaj saklanır
+
+function loadChat() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(STORAGE_KEY));
+    if (Array.isArray(saved?.messages) && saved.messages.length > 0) {
+      // Sayfa cevap yazılırken yenilendiyse yarım kalan mesajı düzelt
+      const messages = saved.messages
+        .map((m) => ({ ...m, streaming: false }))
+        .filter((m) => m.welcome || m.content);
+      return { ...saved, messages };
+    }
+  } catch {
+    // Gizli sekme veya engellenmiş depolama: sorun değil, boş sohbetle başlarız.
+  }
+  return null;
+}
+
+function saveChat(data) {
+  try {
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch {
+    // Depolama doluysa veya engelliyse sessizce geç; sohbet yine çalışır.
+  }
+}
 
 const SUGGESTIONS = [
   "40 bin TL altı oyun laptopu",
@@ -27,13 +57,37 @@ export default function ChatWidget() {
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
   const sendRef = useRef(null);
+  const [restored, setRestored] = useState(false);
+
+  // Sayfa ilk açıldığında kayıtlı sohbeti geri yükle.
+  // Bunu useEffect içinde yapıyoruz: sessionStorage sadece tarayıcıda var,
+  // sunucuda hazırlanan HTML ile ilk görüntü aynı olmalı.
+  useEffect(() => {
+    const saved = loadChat();
+    if (saved) {
+      setMessages(saved.messages);
+      setOpen(Boolean(saved.open));
+    }
+    setRestored(true);
+  }, []);
+
+  // Sohbet veya pencerenin açık/kapalı durumu değiştikçe kaydet.
+  useEffect(() => {
+    if (!restored) return; // geri yükleme bitmeden boş sohbeti kaydetme
+    saveChat({ messages: messages.slice(-MAX_STORED), open });
+  }, [messages, open, restored]);
+
+  function resetChat() {
+    setMessages([WELCOME]);
+    setInput("");
+  }
 
   // Konuşma bitince tanınan metin otomatik olarak gönderilir.
   const speech = useSpeechRecognition({ onResult: (text) => send(text) });
 
   // Yeni mesaj geldiğinde en alta kaydır
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    bottomRef.current?.scrollIntoView({ behavior: loading ? "auto" : "smooth", block: "end" });
   }, [messages, loading, open]);
 
   // Sayfadaki diğer bileşenler ("Asistana sor" kutusu gibi) "tv:ask" olayıyla soru gönderebilir.
@@ -54,9 +108,18 @@ export default function ChatWidget() {
     if (!content || loading) return;
 
     const updated = [...messages, { role: "user", content }];
-    setMessages(updated);
+    // Cevabı yazacağımız boş asistan mesajını hemen ekliyoruz; parçalar geldikçe dolacak.
+    const replyId = Date.now();
+    setMessages([
+      ...updated,
+      { id: replyId, role: "assistant", content: "", products: [], streaming: true },
+    ]);
     setInput("");
     setLoading(true);
+
+    // Sadece bu cevap mesajını güncelleyen yardımcı fonksiyon
+    const updateReply = (change) =>
+      setMessages((prev) => prev.map((m) => (m.id === replyId ? { ...m, ...change(m) } : m)));
 
     try {
       const response = await fetch("/api/chat", {
@@ -65,23 +128,55 @@ export default function ChatWidget() {
         body: JSON.stringify({
           // Hoş geldin ve hata mesajlarını göndermiyoruz, sadece gerçek konuşmayı
           messages: updated
-            .filter((m) => m !== WELCOME && !m.error)
+            .filter((m) => !m.welcome && !m.error && m.content)
             .map(({ role, content }) => ({ role, content })),
         }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Bir hata oluştu.");
 
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: data.reply, products: data.products },
-      ]);
+      // Kullanım sınırı gibi hatalar akış başlamadan normal JSON olarak gelir
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || "Bir hata oluştu.");
+      }
+
+      // Akışı satır satır oku: her satır bir JSON olay
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split("\n");
+        buffer = lines.pop(); // son satır yarım olabilir, sonraki parçayı bekle
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line);
+
+          if (event.type === "text") {
+            updateReply((m) => ({ content: m.content + event.text, status: null }));
+          } else if (event.type === "status") {
+            updateReply(() => ({ status: event.text }));
+          } else if (event.type === "products") {
+            updateReply(() => ({ products: event.products }));
+          } else if (event.type === "comparison") {
+            updateReply(() => ({ comparison: event.comparison }));
+          } else if (event.type === "error") {
+            throw new Error(event.error);
+          }
+        }
+      }
     } catch (error) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: error.message, error: true },
-      ]);
+      updateReply((m) =>
+        m.content
+          ? { content: `${m.content}\n\n${error.message}` }
+          : { content: error.message, error: true }
+      );
     } finally {
+      updateReply(() => ({ streaming: false, status: null }));
       setLoading(false);
     }
   }
@@ -107,6 +202,16 @@ export default function ChatWidget() {
               <p className="font-display font-semibold">Vitrin asistanı</p>
               <p className="text-xs text-white/55">Yaz ya da mikrofona konuş</p>
             </div>
+            <div className="relative flex items-center gap-1">
+            {messages.length > 1 && (
+              <button
+                onClick={resetChat}
+                disabled={loading}
+                className="rounded-lg px-2.5 py-1.5 text-xs text-white/60 transition-colors hover:bg-white/10 hover:text-white disabled:opacity-40"
+              >
+                Yeni sohbet
+              </button>
+            )}
             <button
               onClick={() => setOpen(false)}
               className="relative flex h-8 w-8 items-center justify-center rounded-lg text-white/60 transition-colors hover:bg-white/10 hover:text-white"
@@ -116,6 +221,7 @@ export default function ChatWidget() {
                 <path d="M6 6l12 12M18 6L6 18" />
               </svg>
             </button>
+            </div>
           </div>
 
           <div className="flex-1 space-y-4 overflow-y-auto p-4" aria-live="polite">
@@ -137,17 +243,6 @@ export default function ChatWidget() {
               </div>
             )}
 
-            {loading && (
-              <div className="flex w-fit items-center gap-1.5 rounded-xl rounded-bl-sm bg-white px-4 py-3" aria-label="Asistan yazıyor">
-                {[0, 1, 2].map((i) => (
-                  <span
-                    key={i}
-                    className="h-1.5 w-1.5 rounded-full bg-glacier motion-safe:animate-bounce"
-                    style={{ animationDelay: `${i * 120}ms` }}
-                  />
-                ))}
-              </div>
-            )}
             <div ref={bottomRef} />
           </div>
 
@@ -220,8 +315,41 @@ export default function ChatWidget() {
   );
 }
 
+// **kalın** işaretli kısımları <strong> olarak gösterir; diğer metin olduğu gibi kalır.
+// (dangerouslySetInnerHTML kullanmıyoruz: metin her zaman güvenli şekilde gösterilir.)
+function renderText(text) {
+  return text.split(/(\*\*[^*\n]+\*\*)/g).map((part, i) =>
+    part.startsWith("**") && part.endsWith("**") && part.length > 4 ? (
+      <strong key={i} className="font-semibold">
+        {part.slice(2, -2)}
+      </strong>
+    ) : (
+      part
+    )
+  );
+}
+
 function Message({ message }) {
   const isUser = message.role === "user";
+
+  // Cevap henüz başlamadıysa: üç nokta ve varsa durum metni ("Ürünlere bakıyorum…")
+  if (message.streaming && !message.content) {
+    return (
+      <div className="flex w-fit items-center gap-2.5 rounded-xl rounded-bl-sm bg-white px-4 py-3" aria-label="Asistan yazıyor">
+        <span className="flex gap-1.5">
+          {[0, 1, 2].map((i) => (
+            <span
+              key={i}
+              className="h-1.5 w-1.5 rounded-full bg-glacier motion-safe:animate-bounce"
+              style={{ animationDelay: `${i * 120}ms` }}
+            />
+          ))}
+        </span>
+        {message.status && <span className="text-xs text-steel">{message.status}</span>}
+      </div>
+    );
+  }
+
   return (
     <div className={`flex flex-col gap-2 ${isUser ? "items-end" : "items-start"}`}>
       <div
@@ -233,8 +361,20 @@ function Message({ message }) {
             : "rounded-bl-sm bg-white text-ink"
         }`}
       >
-        {message.content}
+        {isUser || message.error ? message.content : renderText(message.content)}
+        {message.streaming && (
+          <span
+            aria-hidden="true"
+            className="ml-0.5 inline-block h-3.5 w-[2px] translate-y-0.5 bg-glacier motion-safe:animate-pulse"
+          />
+        )}
       </div>
+
+      {message.streaming && message.status && (
+        <p className="text-xs text-steel">{message.status}</p>
+      )}
+
+      {message.comparison && <ComparisonTable comparison={message.comparison} />}
 
       {message.products?.length > 0 && (
         <div className="flex w-full flex-col gap-2">
@@ -256,6 +396,57 @@ function Message({ message }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// Karşılaştırma tablosu: sütunlar ürünler, satırlar özellikler.
+// Her satırdaki en iyi değer fiyort mavisiyle vurgulanır.
+function ComparisonTable({ comparison }) {
+  const { products, rows } = comparison;
+  return (
+    <div className="w-full overflow-x-auto rounded-xl border border-mist bg-white">
+      <table className="w-full border-collapse text-left text-xs">
+        <caption className="sr-only">Ürün karşılaştırması</caption>
+        <thead>
+          <tr className="border-b border-mist">
+            <th scope="col" className="w-[26%] p-2.5 font-normal text-steel">
+              <span className="sr-only">Özellik</span>
+            </th>
+            {products.map((product) => (
+              <th key={product.id} scope="col" className="p-2.5 align-bottom">
+                <Link
+                  href={`/urun/${product.slug}`}
+                  className="font-display text-[0.8rem] font-semibold leading-tight text-ink hover:text-fjord"
+                >
+                  {product.name}
+                </Link>
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, r) => (
+            <tr key={`${row.label}-${r}`} className="border-b border-frost last:border-0">
+              <th scope="row" className="p-2.5 font-normal text-steel">
+                {row.label}
+              </th>
+              {row.values.map((value, i) => {
+                const isBest = row.best.includes(i);
+                return (
+                  <td
+                    key={i}
+                    className={`p-2.5 align-top ${isBest ? "font-semibold text-fjord" : "text-ink"}`}
+                  >
+                    {value}
+                    {isBest && <span className="sr-only"> (en iyi)</span>}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

@@ -1,10 +1,19 @@
 // POST /api/chat
 // Tarayıcıdan gelen sohbet geçmişini alır, Claude'a gönderir,
-// Claude ürün aramak isterse araçları çalıştırır ve son cevabı döndürür.
+// Claude ürün aramak isterse araçları çalıştırır ve cevabı AKIŞ (streaming) olarak döndürür.
 // Bu dosya SADECE sunucuda çalışır; API anahtarı tarayıcıya hiç gitmez.
+//
+// Tarayıcıya giden akışın biçimi: her satır bir JSON olay (NDJSON):
+//   {"type":"text","text":"..."}        → cevaba eklenecek metin parçası
+//   {"type":"status","text":"..."}      → "Ürünlere bakıyorum…" gibi durum bilgisi
+//   {"type":"products","products":[…]}  → gösterilecek ürün kartları
+//   {"type":"comparison","comparison":{…}} → karşılaştırma tablosu
+//   {"type":"error","error":"..."}      → akış sırasında oluşan hata
+//   {"type":"done"}                     → cevap tamamlandı
 
 import { NextResponse } from "next/server";
 import {
+  buildComparison,
   getProductById,
   searchProducts,
   toCardProduct,
@@ -17,17 +26,30 @@ const MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-5-5";
 const MAX_TOOL_ROUNDS = 5; // Sonsuz döngüye karşı güvenlik sınırı
 const MAX_HISTORY = 20; // Claude'a gönderilen en fazla mesaj sayısı
 
+// Vercel'de bu fonksiyonun en fazla kaç saniye çalışabileceği
+export const maxDuration = 60;
+
+// Claude bir aracı kullanmaya başladığında ziyaretçiye gösterilecek durum metinleri
+const TOOL_STATUS = {
+  search_products: "Ürünlere bakıyorum…",
+  get_product_details: "Teknik özellikleri inceliyorum…",
+  show_products: "Ürün kartlarını hazırlıyorum…",
+  compare_products: "Karşılaştırma tablosunu hazırlıyorum…",
+};
+
 const SYSTEM_PROMPT = `Sen TeknoVitrin adlı teknoloji mağazasının satış asistanısın. Mağazada yalnızca laptop, masaüstü bilgisayar ve telefon var. Bilgisayarlar "office" (ofis/günlük kullanım) ve "gaming" (oyun) olarak ikiye ayrılır.
 
 Kurallar:
 - Ürün önermeden önce MUTLAKA search_products aracıyla ara. Yalnızca araçlardan gelen ürünleri öner; ürün, fiyat veya özellik uydurma.
 - Kullanıcının bütçesini (ör. "30 bin altı" = maxPrice 30000), kullanım amacını ve kategorisini arama parametrelerine dönüştür.
 - Önerdiğin ürünleri show_products aracıyla kart olarak göster (en fazla 3 ürün). Önerinin açıklamasını mutlaka yaz; kartlar tek başına cevap değildir.
+- Kullanıcı 2-3 ürünü karşılaştırmak isterse veya iki seçenek arasında kararsızsa compare_products aracını kullan (ürün kimliklerini bilmiyorsan önce search_products ile bul). Tablo ekranda kendiliğinden görünür; değerleri metinde tekrar sayma, sadece en önemli 2-3 farkı ve kime hangisinin uygun olduğunu kısaca yaz. Karşılaştırma yaptığında show_products kullanma.
 - İstek çok belirsizse (ör. sadece "bilgisayar istiyorum") önce kısa bir soru sor: bütçe ve kullanım amacı.
 - Uygun ürün yoksa bunu dürüstçe söyle ve en yakın alternatifi öner.
 - Stokta olmayan ürünleri yalnızca kullanıcı özellikle sorarsa an ve stokta olmadığını belirt.
 - Mağaza dışındaki konulara kibarca kısa cevap ver ve sohbeti ürünlere yönlendir.
-- Türkçe, samimi ve kısa yaz (en fazla 4-5 cümle). Markdown, başlık veya madde işareti kullanma; düz metin yaz. Fiyatları "32.999 TL" biçiminde yaz.`;
+- Türkçe, samimi ve kısa yaz (en fazla 4-5 cümle). Kullanıcıya "sen" diye hitap et. Başlık, liste veya madde işareti kullanma; ürün adlarını **kalın** yazabilirsin. Fiyatları "32.999 TL" biçiminde yaz.
+- Kartlar cevabının altında kendiliğinden görünür; "kartları görebilirsin" gibi cümleler yazma.`;
 
 const TOOLS = [
   {
@@ -61,6 +83,18 @@ const TOOLS = [
     },
   },
   {
+    name: "compare_products",
+    description:
+      "2 veya 3 ürünü yan yana karşılaştırma tablosu olarak kullanıcıya gösterir. Tablo ürün verisinden otomatik oluşturulur ve en iyi değerler vurgulanır. Sonuç olarak ürünlerin özetini döndürür.",
+    input_schema: {
+      type: "object",
+      properties: {
+        product_ids: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 3 },
+      },
+      required: ["product_ids"],
+    },
+  },
+  {
     name: "show_products",
     description: "Önerdiğin ürünleri sohbet penceresinde tıklanabilir kart olarak gösterir.",
     input_schema: {
@@ -74,7 +108,9 @@ const TOOLS = [
 ];
 
 // Claude'un istediği aracı çalıştırır ve sonucunu metin olarak döndürür.
-function runTool(name, input, shownIds) {
+// ctx: bu cevap boyunca ekranda gösterilecekleri tutar ({ shownIds, comparison }).
+function runTool(name, input, ctx) {
+  const { shownIds } = ctx;
   switch (name) {
     case "search_products": {
       const results = searchProducts(input);
@@ -92,6 +128,15 @@ function runTool(name, input, shownIds) {
       }
       return "Ürün kartları kullanıcıya gösterildi.";
     }
+    case "compare_products": {
+      const comparison = buildComparison(input.product_ids ?? []);
+      if (!comparison) {
+        return JSON.stringify({ error: "Karşılaştırma için en az 2 geçerli ürün kimliği gerekli." });
+      }
+      ctx.comparison = comparison;
+      const compared = comparison.products.map((p) => toCompactProduct(getProductById(p.id)));
+      return JSON.stringify({ shownToUser: "Karşılaştırma tablosu gösterildi.", products: compared });
+    }
     default:
       return JSON.stringify({ error: `Bilinmeyen araç: ${name}` });
   }
@@ -102,9 +147,17 @@ function getApiKey() {
   return (process.env.ANTHROPIC_API_KEY ?? "").trim().replace(/^["']|["']$/g, "");
 }
 
-async function callClaude(messages) {
+// Claude'a akış (stream: true) isteği gönderir ve gelen olayları okur.
+// Claude cevabı tek parça yerine "server-sent events" (SSE) olarak, küçük parçalar halinde yollar:
+//   content_block_start  → yeni bir blok başladı (metin veya araç kullanımı)
+//   content_block_delta  → bloğa yeni bir parça geldi (metin veya aracın JSON girdisi)
+//   content_block_stop   → blok bitti
+//   message_delta        → mesajın neden bittiği (stop_reason)
+// Metin parçalarını geldikçe onText ile dışarı verir; sonunda tam mesajı döndürür.
+async function streamClaude(messages, { onText, onToolStart, signal }) {
   const response = await fetch(API_URL, {
     method: "POST",
+    signal, // ziyaretçi sayfadan ayrılırsa Claude isteği de iptal edilir
     headers: {
       "content-type": "application/json",
       "x-api-key": getApiKey(),
@@ -116,6 +169,7 @@ async function callClaude(messages) {
       system: SYSTEM_PROMPT,
       tools: TOOLS,
       messages,
+      stream: true,
     }),
   });
 
@@ -123,7 +177,72 @@ async function callClaude(messages) {
     const detail = await response.text();
     throw new Error(`Claude API hatası (${response.status}): ${detail}`);
   }
-  return response.json();
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const blocks = [];
+  let stopReason = null;
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+
+    // SSE olayları boş bir satırla ayrılır. Tamamlanmış olayları işle, yarım kalanı beklet.
+    let separator;
+    while ((separator = buffer.indexOf("\n\n")) !== -1) {
+      const rawEvent = buffer.slice(0, separator);
+      buffer = buffer.slice(separator + 2);
+
+      const dataLine = rawEvent.split("\n").find((line) => line.startsWith("data:"));
+      if (!dataLine) continue;
+      const event = JSON.parse(dataLine.slice(5).trim());
+
+      switch (event.type) {
+        case "content_block_start": {
+          const block = event.content_block;
+          if (block.type === "tool_use") {
+            blocks[event.index] = { type: "tool_use", id: block.id, name: block.name, input: {}, json: "" };
+            onToolStart?.(block.name);
+          } else if (block.type === "text") {
+            blocks[event.index] = { type: "text", text: "" };
+          }
+          break;
+        }
+        case "content_block_delta": {
+          const block = blocks[event.index];
+          if (!block) break;
+          if (event.delta.type === "text_delta") {
+            block.text += event.delta.text;
+            onText?.(event.delta.text);
+          } else if (event.delta.type === "input_json_delta") {
+            block.json += event.delta.partial_json; // aracın girdisi parça parça gelir
+          }
+          break;
+        }
+        case "content_block_stop": {
+          const block = blocks[event.index];
+          if (block?.type === "tool_use") {
+            block.input = block.json ? JSON.parse(block.json) : {};
+            delete block.json;
+          }
+          break;
+        }
+        case "message_delta":
+          stopReason = event.delta?.stop_reason ?? stopReason;
+          break;
+        case "error":
+          throw new Error(`Claude akış hatası: ${event.error?.message ?? "bilinmiyor"}`);
+      }
+    }
+  }
+
+  // Boş metin blokları API'ye geri gönderilemez; onları ayıklıyoruz.
+  const content = blocks.filter(
+    (block) => block && !(block.type === "text" && !block.text.trim())
+  );
+  return { content, stopReason };
 }
 
 // Tarayıcıdan gelen veriye güvenmeyiz: biçimini kontrol edip temizleriz.
@@ -180,49 +299,89 @@ export async function POST(request) {
     return NextResponse.json({ error: "Mesaj bulunamadı." }, { status: 400 });
   }
 
-  const shownIds = [];
-  const replyParts = []; // Claude her adımda metin yazabilir; hepsini topluyoruz
+  // Akışı başlat: Claude'dan gelen her parçayı anında tarayıcıya ilet.
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      const emit = (event) => controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
+      const ctx = { shownIds: [], comparison: null };
+      const { shownIds } = ctx;
+      let wroteText = false; // şimdiye kadar metin yazıldı mı?
+      let newRound = false; // araç turundan sonra yeni paragraf açmak için
 
-  // Toplanan metinden son cevabı oluşturur.
-  const finish = (fallback) =>
-    NextResponse.json({
-      reply:
-        replyParts.join("\n\n").trim() ||
-        (shownIds.length > 0 ? "Sana uygun bulduğum ürünler şunlar:" : fallback),
-      products: shownIds.map(getProductById).map(toCardProduct),
-    });
+      try {
+        let finished = false;
 
-  try {
-    // Ajan döngüsü: Claude araç istedikçe çalıştır, sonucu geri gönder.
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-      const response = await callClaude(messages);
+        // Ajan döngüsü: Claude araç istedikçe çalıştır, sonucu geri gönder.
+        for (let round = 0; round < MAX_TOOL_ROUNDS && !finished; round++) {
+          const { content, stopReason } = await streamClaude(messages, {
+            signal: request.signal,
+            onText: (text) => {
+              if (newRound && wroteText) emit({ type: "text", text: "\n\n" });
+              newRound = false;
+              wroteText = true;
+              emit({ type: "text", text });
+            },
+            onToolStart: (name) => emit({ type: "status", text: TOOL_STATUS[name] ?? "Düşünüyorum…" }),
+          });
 
-      for (const block of response.content) {
-        if (block.type === "text" && block.text.trim()) replyParts.push(block.text.trim());
+          if (stopReason !== "tool_use") {
+            finished = true;
+            break;
+          }
+
+          // Claude'un araç isteğini geçmişe ekle, araçları çalıştır, sonuçları gönder.
+          messages.push({ role: "assistant", content });
+          const shownBefore = shownIds.length;
+          const comparisonBefore = ctx.comparison;
+          const toolResults = content
+            .filter((block) => block.type === "tool_use")
+            .map((block) => ({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: runTool(block.name, block.input, ctx),
+            }));
+          messages.push({ role: "user", content: toolResults });
+
+          if (ctx.comparison !== comparisonBefore) {
+            emit({ type: "comparison", comparison: ctx.comparison });
+          }
+          if (shownIds.length > shownBefore) {
+            emit({ type: "products", products: shownIds.map(getProductById).map(toCardProduct) });
+          }
+          newRound = true;
+        }
+
+        if (!wroteText) {
+          emit({
+            type: "text",
+            text: ctx.comparison
+              ? "Karşılaştırma tablosu aşağıda:"
+              : shownIds.length > 0
+              ? "Sana uygun bulduğum ürünler şunlar:"
+              : "İsteğini tamamlayamadım, biraz daha basit sorabilir misin?",
+          });
+        }
+        emit({ type: "done" });
+      } catch (error) {
+        if (request.signal.aborted) return; // ziyaretçi ayrıldı, yazacak kimse yok
+        console.error(error); // Detay VS Code terminalinde / Vercel Logs'ta görünür
+        emit({ type: "error", error: "Asistana şu an ulaşılamıyor, biraz sonra tekrar dener misin?" });
+      } finally {
+        try {
+          controller.close();
+        } catch {
+          // akış zaten kapanmış olabilir
+        }
       }
+    },
+  });
 
-      if (response.stop_reason !== "tool_use") {
-        return finish("Bir sorun oldu, mesajını tekrar yazar mısın?");
-      }
-
-      // Claude'un araç isteğini geçmişe ekle, araçları çalıştır, sonuçları gönder.
-      messages.push({ role: "assistant", content: response.content });
-      const toolResults = response.content
-        .filter((block) => block.type === "tool_use")
-        .map((block) => ({
-          type: "tool_result",
-          tool_use_id: block.id,
-          content: runTool(block.name, block.input, shownIds),
-        }));
-      messages.push({ role: "user", content: toolResults });
-    }
-
-    return finish("İsteğini tamamlayamadım, biraz daha basit sorabilir misin?");
-  } catch (error) {
-    console.error(error); // Detay VS Code terminalinde görünür
-    return NextResponse.json(
-      { error: "Asistana şu an ulaşılamıyor. Terminaldeki hata mesajına bak." },
-      { status: 502 }
-    );
-  }
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no", // ara sunucuların akışı biriktirmesini engeller
+    },
+  });
 }
